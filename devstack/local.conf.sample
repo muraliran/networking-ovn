@@ -24,9 +24,9 @@ ADMIN_PASSWORD=password
 #OVN_BRANCH=origin/ovn
 
 #enable_plugin networking-ovn http://git.openstack.org/openstack/networking-ovn
-OVN_REPO=http://github.com/muraliran/ovs.git
+OVN_REPO=https://github.com/muraliran/ovs.git
 OVN_BRANCH=origin/master
-enable_plugin networking-ovn http://github.com/muraliran/networking-ovn.git
+enable_plugin networking-ovn https://github.com/muraliran/networking-ovn.git
 enable_service ovn-northd
 enable_service ovn-controller
 
