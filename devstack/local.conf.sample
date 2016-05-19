@@ -9,7 +9,8 @@
 #
 
 [[local|localrc]]
-
+HOST_IP=159.203.192.157
+SERVICE_HOST=159.203.192.157
 DATABASE_PASSWORD=password
 RABBIT_PASSWORD=password
 SERVICE_PASSWORD=password
@@ -22,7 +23,10 @@ ADMIN_PASSWORD=password
 #OVN_REPO=http://github.com/blp/ovs-reviews.git
 #OVN_BRANCH=origin/ovn
 
-enable_plugin networking-ovn http://git.openstack.org/openstack/networking-ovn
+#enable_plugin networking-ovn http://git.openstack.org/openstack/networking-ovn
+OVN_REPO=http://github.com/muraliran/ovs.git
+OVN_BRANCH=origin/master
+enable_plugin networking-ovn http://github.com/muraliran/networking-ovn.git
 enable_service ovn-northd
 enable_service ovn-controller
 
@@ -43,10 +47,10 @@ enable_service q-meta
 disable_service q-agt
 
 # How to connect to ovsdb-server hosting the OVN NB database.
-#OVN_NB_REMOTE=tcp:$SERVICE_HOST:6641
+OVN_NB_REMOTE=tcp:$SERVICE_HOST:6641
 
 # How to connect to ovsdb-server hosting the OVN SB database.
-#OVN_SB_REMOTE=tcp:$SERVICE_HOST:6642
+OVN_SB_REMOTE=tcp:$SERVICE_HOST:6642
 
 # A UUID to uniquely identify this system.  If one is not specified, a random
 # one will be generated and saved in the file 'ovn-uuid' for re-use in future
@@ -57,9 +61,9 @@ disable_service q-agt
 # OpenStack will use the q-l3 functionality.  If you set OVN_L3_MODE to False,
 # you must also enable the q-l3 service.
 # By default OVN_L3_MODE is True
-#OVN_L3_MODE=False
-#enable_service q-l3
-disable_service q-l3
+OVN_L3_MODE=False
+enable_service q-l3
+#disable_service q-l3
 
 # Whether or not to build custom openvswitch kernel modules from the ovs git
 # tree. This is enabled by default.  This is required unless your distro kernel
