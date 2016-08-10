@@ -15,7 +15,7 @@ General Information and Other Project References:
    features
    contributing
    faq
-   refarch
+   refarch/refarch
    install
 
 Testing and Usage Information:
@@ -34,6 +34,7 @@ Design Notes:
    :maxdepth: 1
 
    design/data_model
+   design/native_dhcp
    design/ovn_worker
 
 Indices and tables

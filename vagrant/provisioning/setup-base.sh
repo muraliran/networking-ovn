@@ -10,6 +10,8 @@
 # $7 - ovn-compute1 short name
 # $8 - ovn-compute2 IP address
 # $9 - ovn-compute2 short name
+# $10 - ovn-vtep IP address
+# $11 - ovn-vtep short name
 MTU=$1
 OVN_DB_IP=$2
 OVN_DB_NAME=$3
@@ -19,6 +21,8 @@ OVN_COMPUTE1_IP=$6
 OVN_COMPUTE1_NAME=$7
 OVN_COMPUTE2_IP=$8
 OVN_COMPUTE2_NAME=$9
+OVN_VTEP_IP=$10
+OVN_VTEP_NAME=$11
 
 BASE_PACKAGES="git bridge-utils ebtables python-pip python-dev build-essential ntp"
 DEBIAN_FRONTEND=noninteractive sudo apt-get -qqy update
@@ -54,6 +58,11 @@ if [ ! -d "networking-ovn/.git" ]; then
     git clone https://git.openstack.org/openstack/networking-ovn.git
 fi
 
+# Use networking-ovn in vagrant home directory when stacking.
+sudo mkdir /opt/stack
+sudo chown vagrant:vagrant /opt/stack
+ln -s ~/networking-ovn /opt/stack/networking-ovn
+
 # We need swap space to do any sort of scale testing with the Vagrant config.
 # Without this, we quickly run out of RAM and the kernel starts whacking things.
 sudo rm -f /swapfile1
@@ -73,6 +82,7 @@ sudo sh -c "echo \"$OVN_DB_IP $OVN_DB_NAME\" >> /etc/hosts"
 sudo sh -c "echo \"$OVN_CONTROLLER_IP $OVN_CONTROLLER_NAME\" >> /etc/hosts"
 sudo sh -c "echo \"$OVN_COMPUTE1_IP $OVN_COMPUTE1_NAME\" >> /etc/hosts"
 sudo sh -c "echo \"$OVN_COMPUTE2_IP $OVN_COMPUTE2_NAME\" >> /etc/hosts"
+sudo sh -c "echo \"$OVN_VTEP_IP $OVN_VTEP_NAME\" >> /etc/hosts"
 
 # Non-interactive SSH setup
 cp networking-ovn/vagrant/provisioning/id_rsa ~/.ssh/id_rsa
