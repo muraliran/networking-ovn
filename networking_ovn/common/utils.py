@@ -12,6 +12,8 @@
 
 import os
 
+from networking_ovn.common import constants
+from neutron.extensions import extra_dhcp_opt as edo_ext
 from neutron_lib import constants as const
 
 
@@ -22,6 +24,26 @@ def ovn_name(id):
     # We prefix the UUID to enable us to use the Neutron UUID when
     # updating, deleting etc.
     return 'neutron-%s' % id
+
+
+def ovn_gateway_router_name(id):
+    "Ovn Gateway Router"
+    return 'ogr-%s' % id
+
+
+def ovn_transit_ls_name(id):
+    "Ovn Transit Logical Switch"
+    return '%s-%s' % (constants.OVN_TRANSIT_LS_NAME_PREFIX, id)
+
+
+def ovn_dtsp_name(id):
+    "Distributed Transit switch port"
+    return 'dtsp-%s' % id
+
+
+def ovn_gtsp_name(id):
+    "Gateway Transit switch port"
+    return 'gtsp-%s' % id
 
 
 def ovn_lrouter_port_name(id):
@@ -51,3 +73,34 @@ def ovn_addrset_name(sg_id, ip_version):
     # with all '-' replaced with '_'. This replacement is necessary
     # because OVN doesn't support '-' in an address set name.
     return ('as-%s-%s' % (ip_version, sg_id)).replace('-', '_')
+
+
+def get_lsp_dhcp_opts(port, ip_version):
+    # Get dhcp options from Neutron port, for setting DHCP_Options row
+    # in OVN.
+    lsp_dhcp_disabled = False
+    lsp_dhcp_opts = {}
+    if port['device_owner'].startswith(const.DEVICE_OWNER_PREFIXES):
+        lsp_dhcp_disabled = True
+    else:
+        for edo in port.get(edo_ext.EXTRADHCPOPTS, []):
+            if edo['ip_version'] != ip_version:
+                continue
+
+            if edo['opt_name'] == 'dhcp_disabled' and (
+                    edo['opt_value'] in ['True', 'true']):
+                # OVN native DHCP is disabled on this port
+                lsp_dhcp_disabled = True
+                # Make sure return value behavior not depends on the order and
+                # content of the extra DHCP options for the port
+                lsp_dhcp_opts.clear()
+                break
+
+            if edo['opt_name'] not in (
+                    constants.SUPPORTED_DHCP_OPTS[ip_version]):
+                continue
+
+            opt = edo['opt_name'].replace('-', '_')
+            lsp_dhcp_opts[opt] = edo['opt_value']
+
+    return (lsp_dhcp_disabled, lsp_dhcp_opts)

@@ -119,27 +119,6 @@ class API(object):
         """
 
     @abc.abstractmethod
-    def get_all_logical_switches_ids(self):
-        """Returns all logical switches names and external ids
-
-        :returns: dictionary with lswitch name and ext ids
-        """
-
-    @abc.abstractmethod
-    def get_logical_switch_ids(self, lswitch_name):
-        """Get external_ids for a Logical_Switch.
-
-        :returns: dict of external_ids.
-        """
-
-    @abc.abstractmethod
-    def get_all_logical_switch_ports_ids(self):
-        """Returns all logical switch ports names and external ids
-
-        :returns: dictionary with lsp name and ext ids
-        """
-
-    @abc.abstractmethod
     def create_lrouter(self, name, may_exist=True, **columns):
         """Create a command to add an OVN lrouter
 
@@ -429,20 +408,21 @@ class API(object):
     def get_subnet_dhcp_options(self, subnet_id):
         """Returns the Subnet DHCP options as a dictionary
 
-        :param subnet_id:      The subnet id whose DHCP options to be returned
+        :param subnet_id:      The subnet id whose DHCP options are returned
         :type subnet_id:       string
         :returns:              Returns the columns of the DHCP_Options as a
-                               dictionary
+                               dictionary. None is returned if no DHCP options.
         """
 
     @abc.abstractmethod
-    def get_port_dhcp_options(self, subnet_id, port_id):
-        """Returns the Logical switch port DHCP_Options as a dictionary
+    def get_subnets_dhcp_options(self, subnet_ids):
+        """Returns the Subnets DHCP options as list of dictionary
 
-        :returns:              Returns the columns of the DHCP_Options as a
-                               dictionary belonging to the logical switch port
-                               and subnet specified in the @param port_id and
-                               @param subnet_id
+        :param subnet_ids:     The subnet ids whose DHCP options are returned
+        :type subnet_ids:      list of string
+        :returns:              Returns the columns of the DHCP_Options as list
+                               of dictionary. Empty list is returned if no
+                               DHCP_Options matched found.
         """
 
     @abc.abstractmethod
@@ -467,9 +447,79 @@ class API(object):
         :returns: dictionary indexed by name, DB columns as values
         """
 
+    @abc.abstractmethod
+    def get_router_port_options(self, lsp_name):
+        """Get options set for lsp of type router
+
+        :returns: router port options
+        """
+
+    @abc.abstractmethod
+    def add_nat_rule_in_lrouter(self, lrouter, **columns):
+        """Add NAT rule in logical router
+
+
+        :param lrouter:      The unique name of the lrouter
+        :type lrouter:       string
+        :param columns:      Dictionary of nat columns
+                             Supported columns: type, logical_ip, external_ip
+        :type columns:       dictionary
+        :returns:            :class:`Command` with no result
+        """
+
+    @abc.abstractmethod
+    def delete_nat_rule_in_lrouter(self, lrouter, type, logical_ip,
+                                   external_ip, if_exists=True):
+        """Delete NAT rule in logical router
+
+        :param lrouter:      The unique name of the lrouter
+        :type lrouter:       string
+        :param type:         Type of nat. Supported values are 'snat', 'dnat'
+                             and 'dnat_and_snat'
+        :type type:          string
+        :param logical_ip:   IP or network that needs to be natted
+        :type logical_ip:    string
+        :param logical_ip:   External IP to be used for nat
+        :type external_ip:   string
+        :type if_exists:     bool
+        :returns:            :class:`Command` with no result
+        """
+
+    @abc.abstractmethod
+    def add_nat_ip_to_lrport_peer_options(self, lport, nat_ip):
+        """Add nat address in peer port of lrouter port
+
+        :param lport:   The unique name of the lswitch port
+        :type lport:    string
+        :param nat_ip:  nat ip to be added
+        :type nat_ip:   string
+        :returns:       :class:`Command` with no result
+        """
+
+    @abc.abstractmethod
+    def delete_nat_ip_from_lrport_peer_options(self, lport, nat_ip):
+        """Delete nat address from peer port of lrouter port
+
+        :param lport:   The unique name of the lswitch port
+        :type lport:    string
+        :param nat_ip:  nat ip to be removed
+        :type nat_ip:   string
+        :returns:       :class:`Command` with no result
+        """
+
 
 @six.add_metaclass(abc.ABCMeta)
 class SbAPI(object):
+
+    @abc.abstractmethod
+    def chassis_exists(self, hostname):
+        """Test if chassis for given hostname exists.
+
+        @param hostname:       The hostname of the chassis
+        @type hostname:        string
+        :returns:              True if the chassis exists, else False.
+        """
+
     @abc.abstractmethod
     def get_chassis_hostname_and_physnets(self):
         """Return a dict contains hostname and physnets mapping.
@@ -484,4 +534,17 @@ class SbAPI(object):
 
         :param chassis_type:    The type of chassis
         :type chassis_type:     string
+        """
+
+    @abc.abstractmethod
+    def get_chassis_data_for_ml2_bind_port(self, hostname):
+        """Return chassis data for ML2 port binding.
+
+        @param hostname:       The hostname of the chassis
+        @type hostname:        string
+        :returns:              Tuple containing the chassis datapath type,
+                               iface types and physical networks for the
+                               OVN bridge mappings.
+        :raises:               RuntimeError exception if an OVN chassis
+                               does not exist.
         """

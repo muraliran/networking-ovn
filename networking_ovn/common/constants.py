@@ -13,6 +13,7 @@
 from neutron.extensions import portbindings
 import six
 
+OVN_ML2_MECH_DRIVER_NAME = 'ovn'
 OVN_NETWORK_NAME_EXT_ID_KEY = 'neutron:network_name'
 OVN_PORT_NAME_EXT_ID_KEY = 'neutron:port_name'
 OVN_ROUTER_NAME_EXT_ID_KEY = 'neutron:router_name'
@@ -23,8 +24,15 @@ OVN_SEGID_EXT_ID_KEY = 'neutron:provnet-segmentation-id'
 OVN_PORT_BINDING_PROFILE = portbindings.PROFILE
 OVN_PORT_BINDING_PROFILE_PARAMS = [{'parent_name': six.string_types,
                                     'tag': six.integer_types},
-                                   {'vtep_physical_switch': six.string_types,
-                                    'vtep_logical_switch': six.string_types}]
+                                   {'vtep-physical-switch': six.string_types,
+                                    'vtep-logical-switch': six.string_types}]
+OVN_L3_ADMIN_NET_NAME = 'OVN_L3_ADMIN_NETWORK'
+OVN_L3_ADMIN_NET_SUBNET_NAME = 'OVN_L3_ADMIN_SUBNET'
+OVN_L3_ADMIN_NET_PORT_DEVICE_ID = 'OVN_L3_ADMIN_NETWORK_PORT'
+OVN_L3_ADMIN_NET_PORT_DEVICE_OWNER = 'OVN_L3_ADMIN_NETWORK'
+OVN_ROUTER_PORT_OPTION_KEYS = ['router-port', 'nat-addresses']
+OVN_L3_ADMIN_NET_PORT_NAMES = ['DTSP', 'GTSP']
+OVN_TRANSIT_LS_NAME_PREFIX = 'otls'
 
 # OVN ACLs have priorities.  The highest priority ACL that matches is the one
 # that takes effect.  Our choice of priority numbers is arbitrary, but it
@@ -43,3 +51,16 @@ ACL_ACTION_ALLOW = 'allow'
 # the options column of the Logical Router. This value is used to detect
 # unhosted router gateways to schedule.
 OVN_GATEWAY_INVALID_CHASSIS = 'neutron-ovn-invalid-chassis'
+
+SUPPORTED_DHCP_OPTS = {
+    4: ['netmask', 'router', 'dns-server', 'log-server',
+        'lpr-server', 'swap-server', 'ip-forward-enable',
+        'policy-filter', 'default-ttl', 'mtu', 'router-discovery',
+        'router-solicitation', 'arp-timeout', 'ethernet-encap',
+        'tcp-ttl', 'tcp-keepalive', 'nis-server', 'ntp-server',
+        'tftp-server'],
+    6: ['server-id', 'dns-server', 'domain-search']}
+DHCPV6_STATELESS_OPT = 'dhcpv6_stateless'
+
+CHASSIS_DATAPATH_NETDEV = 'netdev'
+CHASSIS_IFACE_DPDKVHOSTUSER = 'dpdkvhostuser'

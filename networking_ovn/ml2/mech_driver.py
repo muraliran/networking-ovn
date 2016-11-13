@@ -19,6 +19,7 @@ from neutron_lib.api import validators
 from neutron_lib import constants as const
 from neutron_lib import exceptions as n_exc
 from oslo_config import cfg
+from oslo_db import exception as os_db_exc
 from oslo_log import log
 import six
 
@@ -28,8 +29,6 @@ from neutron.callbacks import resources
 from neutron.common import utils as n_utils
 from neutron import context as n_context
 from neutron.db import provisioning_blocks
-from neutron.extensions import extra_dhcp_opt as edo_ext
-from neutron.extensions import multiprovidernet as mpnet
 from neutron.extensions import portbindings
 from neutron.extensions import portsecurity as psec
 from neutron.extensions import providernet as pnet
@@ -45,6 +44,7 @@ from networking_ovn.common import config
 from networking_ovn.common import constants as ovn_const
 from networking_ovn.common import utils
 from networking_ovn.ml2 import qos_driver
+from networking_ovn.ml2 import trunk_driver
 from networking_ovn import ovn_db_sync
 from networking_ovn.ovsdb import impl_idl_ovn
 from networking_ovn.ovsdb import ovsdb_monitor
@@ -56,7 +56,8 @@ OvnPortInfo = collections.namedtuple('OvnPortInfo', ['type', 'options',
                                                      'addresses',
                                                      'port_security',
                                                      'parent_name', 'tag',
-                                                     'dhcpv4_options'])
+                                                     'dhcpv4_options',
+                                                     'dhcpv6_options'])
 
 
 class OVNMechanismDriver(driver_api.MechanismDriver):
@@ -99,7 +100,7 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         self._setup_vif_port_bindings()
         self.subscribe()
         self.qos_driver = qos_driver.OVNQosDriver(self)
-        self._init_dhcp_opt_codes()
+        self.trunk_driver = trunk_driver.OVNTrunkDriver.create(self)
 
     @property
     def _plugin(self):
@@ -115,29 +116,17 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
 
     def _setup_vif_port_bindings(self):
         self.supported_vnic_types = [portbindings.VNIC_NORMAL]
-        # NOTE(rtheis): Config for vif_type will ensure valid choices.
-        if config.get_ovn_vif_type() == portbindings.VIF_TYPE_VHOST_USER:
-            self.vif_type = portbindings.VIF_TYPE_VHOST_USER
-            self.vif_details = {
+        self.vif_details = {
+            portbindings.VIF_TYPE_OVS: {
+                portbindings.CAP_PORT_FILTER: self.sg_enabled
+            },
+            portbindings.VIF_TYPE_VHOST_USER: {
                 portbindings.CAP_PORT_FILTER: False,
                 portbindings.VHOST_USER_MODE:
                 portbindings.VHOST_USER_MODE_CLIENT,
-                portbindings.VHOST_USER_OVS_PLUG: True,
+                portbindings.VHOST_USER_OVS_PLUG: True
             }
-        else:
-            self.vif_type = portbindings.VIF_TYPE_OVS,
-            self.vif_details = {
-                portbindings.CAP_PORT_FILTER: self.sg_enabled,
-            }
-
-    def _init_dhcp_opt_codes(self):
-        self._supported_dhcp_opts = [
-            'netmask', 'router', 'dns-server', 'log-server',
-            'lpr-server', 'swap-server', 'ip-forward-enable',
-            'policy-filter', 'default-ttl', 'mtu', 'router-discovery',
-            'router-solicitation', 'arp-timeout', 'ethernet-encap',
-            'tcp-ttl', 'tcp-keepalive', 'nis-server', 'ntp-server',
-            'tftp-server']
+        }
 
     def subscribe(self):
         registry.subscribe(self.post_fork_initialize,
@@ -234,6 +223,28 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                                                sg_rule,
                                                is_add_acl=is_add_acl)
 
+    def _is_network_type_supported(self, network_type):
+        return (network_type in [plugin_const.TYPE_LOCAL,
+                                 plugin_const.TYPE_FLAT,
+                                 plugin_const.TYPE_GENEVE,
+                                 plugin_const.TYPE_VLAN])
+
+    def _validate_network_segments(self, network_segments):
+        for network_segment in network_segments:
+            network_type = network_segment['network_type']
+            segmentation_id = network_segment['segmentation_id']
+            physical_network = network_segment['physical_network']
+            LOG.debug('Validating network segment with '
+                      'type %(network_type)s, '
+                      'segmentation ID %(segmentation_id)s, '
+                      'physical network %(physical_network)s' %
+                      {'network_type': network_type,
+                       'segmentation_id': segmentation_id,
+                       'physical_network': physical_network})
+            if not self._is_network_type_supported(network_type):
+                msg = _('Network type %s is not supported') % network_type
+                raise n_exc.InvalidInput(error_message=msg)
+
     def create_network_precommit(self, context):
         """Allocate resources for a new network.
 
@@ -245,31 +256,7 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         cannot block.  Raising an exception will result in a rollback
         of the current transaction.
         """
-        network = context.current
-
-        # TODO(rtheis): Add support for multi-provider networks when
-        # routed networks are supported.
-        if self._get_attribute(network, mpnet.SEGMENTS):
-            msg = _('Multi-provider networks are not supported')
-            raise n_exc.InvalidInput(error_message=msg)
-
-        network_segments = context.network_segments
-        network_type = network_segments[0]['network_type']
-        segmentation_id = network_segments[0]['segmentation_id']
-        physical_network = network_segments[0]['physical_network']
-        LOG.debug('Creating network with type %(network_type)s, '
-                  'segmentation ID %(segmentation_id)s, '
-                  'physical network %(physical_network)s' %
-                  {'network_type': network_type,
-                   'segmentation_id': segmentation_id,
-                   'physical_network': physical_network})
-
-        if network_type not in [plugin_const.TYPE_LOCAL,
-                                plugin_const.TYPE_FLAT,
-                                plugin_const.TYPE_GENEVE,
-                                plugin_const.TYPE_VLAN]:
-            msg = _('Network type %s is not supported') % network_type
-            raise n_exc.InvalidInput(error_message=msg)
+        self._validate_network_segments(context.network_segments)
 
     def create_network_postcommit(self, context):
         """Create a network.
@@ -319,6 +306,24 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         ext_id = [ovn_const.OVN_NETWORK_NAME_EXT_ID_KEY, name]
         self._nb_ovn.set_lswitch_ext_id(
             utils.ovn_name(network_id), ext_id).execute(check_error=True)
+
+    def update_network_precommit(self, context):
+        """Update resources of a network.
+
+        :param context: NetworkContext instance describing the new
+        state of the network, as well as the original state prior
+        to the update_network call.
+
+        Update values of a network, updating the associated resources
+        in the database. Called inside transaction context on session.
+        Raising an exception will result in rollback of the
+        transaction.
+
+        update_network_precommit is called for all changes to the
+        network state. It is up to the mechanism driver to ignore
+        state or state changes that it does not know or care about.
+        """
+        self._validate_network_segments(context.network_segments)
 
     def update_network_postcommit(self, context):
         """Update a network.
@@ -378,11 +383,20 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
             with self._nb_ovn.transaction(check_error=True) as txn:
                 subnet_dhcp_options = self._nb_ovn.get_subnet_dhcp_options(
                     subnet['id'])
-                txn.add(self._nb_ovn.delete_dhcp_options(
-                    subnet_dhcp_options['uuid']))
+                if subnet_dhcp_options:
+                    txn.add(self._nb_ovn.delete_dhcp_options(
+                        subnet_dhcp_options['uuid']))
 
-    def add_subnet_dhcp_options_in_ovn(self, subnet, network):
-        ovn_dhcp_options = self._get_ovn_dhcp_options(subnet, network)
+    def add_subnet_dhcp_options_in_ovn(self, subnet, network,
+                                       ovn_dhcp_options=None):
+        # Don't insert DHCP_Options entry for v6 subnet with 'SLAAC' as
+        # 'ipv6_address_mode', since DHCPv6 shouldn't work for this mode.
+        if (subnet['ip_version'] == const.IP_VERSION_6 and
+                subnet.get('ipv6_address_mode') == const.IPV6_SLAAC):
+            return
+
+        if not ovn_dhcp_options:
+            ovn_dhcp_options = self.get_ovn_dhcp_options(subnet, network)
 
         txn_commands = self._nb_ovn.compose_dhcp_options_commands(
             subnet['id'], **ovn_dhcp_options)
@@ -390,18 +404,21 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
             for cmd in txn_commands:
                 txn.add(cmd)
 
-    def _get_ovn_dhcp_options(self, subnet, network):
+    def get_ovn_dhcp_options(self, subnet, network, server_mac=None):
         external_ids = {'subnet_id': subnet['id']}
         dhcp_options = {'cidr': subnet['cidr'], 'options': {},
                         'external_ids': external_ids}
 
-        if subnet['ip_version'] == 4 and subnet['enable_dhcp']:
-            dhcp_options['options'] = self._get_ovn_dhcpv4_opts(subnet,
-                                                                network)
+        if subnet['enable_dhcp']:
+            if subnet['ip_version'] == const.IP_VERSION_4:
+                dhcp_options['options'] = self._get_ovn_dhcpv4_opts(
+                    subnet, network, server_mac=server_mac)
+            else:
+                dhcp_options['options'] = self._get_ovn_dhcpv6_opts(subnet)
 
         return dhcp_options
 
-    def _get_ovn_dhcpv4_opts(self, subnet, network):
+    def _get_ovn_dhcpv4_opts(self, subnet, network, server_mac=None):
         if not subnet['gateway_ip']:
             return {}
 
@@ -409,18 +426,19 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         mtu = network['mtu']
         options = {
             'server_id': subnet['gateway_ip'],
-            'server_mac': n_utils.get_random_mac(cfg.CONF.base_mac.split(':')),
             'lease_time': default_lease_time,
             'mtu': str(mtu),
             'router': subnet['gateway_ip']
         }
 
+        if server_mac:
+            options['server_mac'] = server_mac
+        else:
+            options['server_mac'] = n_utils.get_random_mac(
+                cfg.CONF.base_mac.split(':'))
+
         if subnet['dns_nameservers']:
-            dns_servers = '{'
-            for dns in subnet["dns_nameservers"]:
-                dns_servers += dns + ', '
-            dns_servers = dns_servers.strip(', ')
-            dns_servers += '}'
+            dns_servers = '{%s}' % ', '.join(subnet['dns_nameservers'])
             options['dns_server'] = dns_servers
 
         # If subnet hostroutes are defined, add them in the
@@ -440,6 +458,22 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
 
         return options
 
+    def _get_ovn_dhcpv6_opts(self, subnet):
+        """Returns the DHCPv6 options"""
+
+        dhcpv6_opts = {
+            'server_id': n_utils.get_random_mac(cfg.CONF.base_mac.split(':'))
+        }
+
+        if subnet['dns_nameservers']:
+            dns_servers = '{%s}' % ', '.join(subnet['dns_nameservers'])
+            dhcpv6_opts['dns_server'] = dns_servers
+
+        if subnet.get('ipv6_address_mode') == const.DHCPV6_STATELESS:
+            dhcpv6_opts[ovn_const.DHCPV6_STATELESS_OPT] = 'true'
+
+        return dhcpv6_opts
+
     def create_port_precommit(self, context):
         """Allocate resources for a new port.
 
@@ -450,14 +484,11 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         cannot block.  Raising an exception will result in a rollback
         of the current transaction.
         """
-        self.validate_and_get_data_from_binding_profile(context.current)
+        port = context.current
+        self.validate_and_get_data_from_binding_profile(port)
+        if self._is_port_provisioning_required(port, context.host):
+            self._insert_port_provisioning_block(context._plugin_context, port)
 
-    # TODO(rtheis): The neutron ML2 plugin does not provide drivers with
-    # an interface to validate port bindings before the precommit stage.
-    # As a result, the plugin will map a validate error here to a
-    # MechanismDriverError. This makes it harder for users to determine
-    # mistakes in the binding profile. Refactor this as needed based
-    # on resolution to https://bugs.launchpad.net/neutron/+bug/1589622.
     def validate_and_get_data_from_binding_profile(self, port):
         if (ovn_const.OVN_PORT_BINDING_PROFILE not in port or
                 not validators.is_attr_set(
@@ -514,21 +545,46 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
 
         return param_dict
 
-    def _insert_port_provisioning_block(self, port):
+    def _is_port_provisioning_required(self, port, host, original_host=None):
         vnic_type = port.get(portbindings.VNIC_TYPE, portbindings.VNIC_NORMAL)
         if vnic_type not in self.supported_vnic_types:
-            LOG.debug("No provisioning block due to unsupported vnic_type: %s",
-                      vnic_type)
-            return
+            LOG.debug('No provisioning block for port %(port_id)s due to '
+                      'unsupported vnic_type: %(vnic_type)s',
+                      {'port_id': port['id'], 'vnic_type': vnic_type})
+            return False
+
+        if port['status'] == const.PORT_STATUS_ACTIVE:
+            LOG.debug('No provisioning block for port %s since it is active',
+                      port['id'])
+            return False
+
+        if not host:
+            LOG.debug('No provisioning block for port %s since it does not '
+                      'have a host', port['id'])
+            return False
+
+        if host == original_host:
+            LOG.debug('No provisioning block for port %s since host unchanged',
+                      port['id'])
+            return False
+
+        if not self._sb_ovn.chassis_exists(host):
+            LOG.debug('No provisioning block for port %(port_id)s since no '
+                      'OVN chassis for host: %(host)s',
+                      {'port_id': port['id'], 'host': host})
+            return False
+
+        return True
+
+    def _insert_port_provisioning_block(self, context, port):
         # Insert a provisioning block to prevent the port from
         # transitioning to active until OVN reports back that
         # the port is up.
-        if port['status'] != const.PORT_STATUS_ACTIVE:
-            provisioning_blocks.add_provisioning_component(
-                n_context.get_admin_context(),
-                port['id'], resources.PORT,
-                provisioning_blocks.L2_AGENT_ENTITY
-            )
+        provisioning_blocks.add_provisioning_component(
+            context,
+            port['id'], resources.PORT,
+            provisioning_blocks.L2_AGENT_ENTITY
+        )
 
     def create_port_postcommit(self, context):
         """Create a port.
@@ -542,7 +598,6 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         """
         port = context.current
         ovn_port_info = self.get_ovn_port_options(port)
-        self._insert_port_provisioning_block(port)
         self.create_port_in_ovn(port, ovn_port_info)
 
     def _get_allowed_addresses_from_port(self, port):
@@ -569,20 +624,20 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
 
         return list(allowed_addresses)
 
-    def get_ovn_port_options(self, port, qos_options=None, original_port=None):
+    def get_ovn_port_options(self, port, qos_options=None):
         binding_profile = self.validate_and_get_data_from_binding_profile(port)
         if qos_options is None:
             qos_options = self.qos_driver.get_qos_options(port)
-        vtep_physical_switch = binding_profile.get('vtep_physical_switch')
+        vtep_physical_switch = binding_profile.get('vtep-physical-switch')
         parent_name = None
         tag = None
         port_type = None
 
         if vtep_physical_switch:
-            vtep_logical_switch = binding_profile.get('vtep_logical_switch')
+            vtep_logical_switch = binding_profile.get('vtep-logical-switch')
             port_type = 'vtep'
-            options = {'vtep_physical_switch': vtep_physical_switch,
-                       'vtep_logical_switch': vtep_logical_switch}
+            options = {'vtep-physical-switch': vtep_physical_switch,
+                       'vtep-logical-switch': vtep_logical_switch}
             addresses = "unknown"
             port_security = []
         else:
@@ -594,14 +649,11 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                 addresses += ' ' + ip['ip_address']
             port_security = self._get_allowed_addresses_from_port(port)
 
-        port_dhcpv4_options_info = self._get_port_dhcpv4_options(
-            port, original_port=original_port)
-        dhcpv4_options = []
-        if port_dhcpv4_options_info and 'uuid' in port_dhcpv4_options_info:
-            dhcpv4_options = [port_dhcpv4_options_info['uuid']]
+        dhcpv4_options = self.get_port_dhcp_options(port, const.IP_VERSION_4)
+        dhcpv6_options = self.get_port_dhcp_options(port, const.IP_VERSION_6)
 
         return OvnPortInfo(port_type, options, [addresses], port_security,
-                           parent_name, tag, dhcpv4_options)
+                           parent_name, tag, dhcpv4_options, dhcpv6_options)
 
     def create_port_in_ovn(self, port, ovn_port_info):
         external_ids = {ovn_const.OVN_PORT_NAME_EXT_ID_KEY: port['name']}
@@ -611,6 +663,18 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         subnet_cache = {}
 
         with self._nb_ovn.transaction(check_error=True) as txn:
+            if not ovn_port_info.dhcpv4_options:
+                dhcpv4_options = []
+            elif 'cmd' in ovn_port_info.dhcpv4_options:
+                dhcpv4_options = txn.add(ovn_port_info.dhcpv4_options['cmd'])
+            else:
+                dhcpv4_options = [ovn_port_info.dhcpv4_options['uuid']]
+            if not ovn_port_info.dhcpv6_options:
+                dhcpv6_options = []
+            elif 'cmd' in ovn_port_info.dhcpv6_options:
+                dhcpv6_options = txn.add(ovn_port_info.dhcpv6_options['cmd'])
+            else:
+                dhcpv6_options = [ovn_port_info.dhcpv6_options['uuid']]
             # The lport_name *must* be neutron port['id'].  It must match the
             # iface-id set in the Interfaces table of the Open_vSwitch
             # database which nova sets to be the port ID.
@@ -625,7 +689,8 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                     options=ovn_port_info.options,
                     type=ovn_port_info.type,
                     port_security=ovn_port_info.port_security,
-                    dhcpv4_options=ovn_port_info.dhcpv4_options))
+                    dhcpv4_options=dhcpv4_options,
+                    dhcpv6_options=dhcpv6_options))
 
             acls_new = ovn_acl.add_acls(self._plugin, admin_context,
                                         port, sg_cache, subnet_cache)
@@ -662,7 +727,11 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         state. It is up to the mechanism driver to ignore state or
         state changes that it does not know or care about.
         """
-        self.validate_and_get_data_from_binding_profile(context.current)
+        port = context.current
+        self.validate_and_get_data_from_binding_profile(port)
+        if self._is_port_provisioning_required(port, context.host,
+                                               context.original_host):
+            self._insert_port_provisioning_block(context._plugin_context, port)
 
     def update_port_postcommit(self, context):
         """Update a port.
@@ -685,8 +754,7 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         self.update_port(port, original_port)
 
     def update_port(self, port, original_port, qos_options=None):
-        ovn_port_info = self.get_ovn_port_options(port, qos_options,
-                                                  original_port=original_port)
+        ovn_port_info = self.get_ovn_port_options(port, qos_options)
         self._update_port_in_ovn(original_port, port, ovn_port_info)
 
     def _update_port_in_ovn(self, original_port, port, ovn_port_info):
@@ -697,6 +765,27 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         subnet_cache = {}
 
         with self._nb_ovn.transaction(check_error=True) as txn:
+            if port.get('device_owner') in [const.DEVICE_OWNER_ROUTER_INTF,
+                                            const.DEVICE_OWNER_ROUTER_GW]:
+                ovn_port_info.options.update(
+                    self._nb_ovn.get_router_port_options(port['id']))
+            if not ovn_port_info.dhcpv4_options:
+                dhcpv4_options = []
+            elif 'cmd' in ovn_port_info.dhcpv4_options:
+                dhcpv4_options = txn.add(ovn_port_info.dhcpv4_options['cmd'])
+            else:
+                dhcpv4_options = [ovn_port_info.dhcpv4_options['uuid']]
+            if not ovn_port_info.dhcpv6_options:
+                dhcpv6_options = []
+            elif 'cmd' in ovn_port_info.dhcpv6_options:
+                dhcpv6_options = txn.add(ovn_port_info.dhcpv6_options['cmd'])
+            else:
+                dhcpv6_options = [ovn_port_info.dhcpv6_options['uuid']]
+            # NOTE(lizk): Fail port updating if port doesn't exist. This
+            # prevents any new inserted resources to be orphan, such as port
+            # dhcp options or ACL rules for port, e.g. a port was created
+            # without extra dhcp options and security group, while updating
+            # includes the new attributes setting to port.
             txn.add(self._nb_ovn.set_lswitch_port(
                     lport_name=port['id'],
                     addresses=ovn_port_info.addresses,
@@ -707,7 +796,9 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                     options=ovn_port_info.options,
                     enabled=port['admin_state_up'],
                     port_security=ovn_port_info.port_security,
-                    dhcpv4_options=ovn_port_info.dhcpv4_options))
+                    dhcpv4_options=dhcpv4_options,
+                    dhcpv6_options=dhcpv6_options,
+                    if_exists=False))
 
             # Determine if security groups or fixed IPs are updated.
             old_sg_ids = set(original_port.get('security_groups', []))
@@ -773,94 +864,75 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                                         addrs_add=addr_add,
                                         addrs_remove=addr_remove))
 
-            if not ovn_port_info.dhcpv4_options:
-                # Check if the DHCP_Options row exist for this port.
-                # We need to delete it as it is no longer referenced by this
-                # port.
-                cmd = self._get_delete_lsp_dhcpv4_options_cmd(port)
-                if cmd:
-                    txn.add(cmd)
+    def _get_subnet_dhcp_options_for_port(self, port, ip_version):
+        """Returns the subnet dhcp options for the port.
 
-    def _get_delete_lsp_dhcpv4_options_cmd(self, port):
-        lsp_dhcp_options = None
-        for fixed_ip in port['fixed_ips']:
-            if netaddr.IPAddress(fixed_ip['ip_address']).version == 4:
-                lsp_dhcp_options = self._nb_ovn.get_port_dhcp_options(
-                    fixed_ip['subnet_id'], port['id'])
-                if lsp_dhcp_options:
-                    break
+        Return the first found DHCP options belong for the port.
+        """
+        subnets = [
+            fixed_ip['subnet_id']
+            for fixed_ip in port['fixed_ips']
+            if netaddr.IPAddress(fixed_ip['ip_address']).version == ip_version]
+        get_opts = self._nb_ovn.get_subnets_dhcp_options(subnets)
+        if get_opts:
+            if ip_version == const.IP_VERSION_6:
+                # Always try to find a dhcpv6 stateful v6 subnet to return.
+                # This ensures port can get one stateful v6 address when port
+                # has multiple dhcpv6 stateful and stateless subnets.
+                for opts in get_opts:
+                    # We are setting ovn_const.DHCPV6_STATELESS_OPT to "true"
+                    # in _get_ovn_dhcpv6_opts, so entries in DHCP_Options table
+                    # should have unicode type 'true' if they were defined as
+                    # dhcpv6 stateless.
+                    if opts['options'].get(
+                        ovn_const.DHCPV6_STATELESS_OPT) != 'true':
+                        return opts
+            return get_opts[0]
 
-        if lsp_dhcp_options:
-            # Delete the DHCP_Options row created for this port.
-            # A separate DHCP_Options row would have be created since the port
-            # has extra DHCP options defined.
-            return self._nb_ovn.delete_dhcp_options(lsp_dhcp_options['uuid'])
+    def get_port_dhcp_options(self, port, ip_version):
+        """Return dhcp options for port.
 
-    def _get_port_dhcpv4_options(self, port, original_port=None):
-        lsp_dhcpv4_options = {}
-        lsp_dhcp_disabled = False
-        for edo in port.get(edo_ext.EXTRADHCPOPTS, []):
-            if edo['opt_name'] == 'dhcp_disabled' and (
-                    edo['opt_value'] in ['True', 'true']):
-                # OVN native DHCPv4 is disabled on this port
-                lsp_dhcp_disabled = True
-                break
-
-            if edo['ip_version'] != 4 or (
-                edo['opt_name'] not in self._supported_dhcp_opts):
-                continue
-
-            opt = edo['opt_name'].replace('-', '_')
-            lsp_dhcpv4_options[opt] = edo['opt_value']
+        In case the port is dhcp disabled, or IP addresses it has belong
+        to dhcp disabled subnets, returns None.
+        Otherwise, returns a dict:
+         - with content from a existing DHCP_Options row for subnet, if the
+           port has no extra dhcp optoins.
+         - with only one item ('cmd', AddDHCPOptionsCommand(..)), if the port
+           has extra dhcp options. The command should be processed in the same
+           transaction with port creating or updating command to avoid orphan
+           row issue happen.
+        """
+        lsp_dhcp_disabled, lsp_dhcp_opts = utils.get_lsp_dhcp_opts(
+            port, ip_version)
 
         if lsp_dhcp_disabled:
             return
 
-        # If the port has multiple IPv4 addresses, DHCPv4 options are set
-        # for the first address in port['fixed_ips']
-        subnet_dhcp_options = None
-        subnet_id = None
-        for fixed_ip in port['fixed_ips']:
-            if netaddr.IPAddress(fixed_ip['ip_address']).version == 4:
-                subnet_dhcp_options = self._nb_ovn.get_subnet_dhcp_options(
-                    fixed_ip['subnet_id'])
-                subnet_id = fixed_ip['subnet_id']
-                if subnet_dhcp_options:
-                    break
+        subnet_dhcp_options = self._get_subnet_dhcp_options_for_port(
+            port, ip_version)
 
         if not subnet_dhcp_options:
-            # Ideally this should not happen.
-            # May be a sync is required in such cases ?
+            # NOTE(lizk): It's possible for Neutron to configure a port with IP
+            # address belongs to subnet disabled dhcp. And no DHCP_Options row
+            # wll be inserted for such a subnet. So in that case, the subnet
+            # dhcp options here will be None.
             return
 
-        if not lsp_dhcpv4_options:
-            if original_port and original_port.get(edo_ext.EXTRADHCPOPTS, []):
-                # Extra DHCP options were define for this port.
-                # Delete the DHCP_Options row created for this port earlier.
-                cmd = self._get_delete_lsp_dhcpv4_options_cmd(original_port)
-                if cmd:
-                    with self._nb_ovn.transaction(check_error=True) as txn:
-                        txn.add(cmd)
+        if not lsp_dhcp_opts:
             return subnet_dhcp_options
 
-        # This port has extra DHCP options defined.
-        # So we need to create a new row in DHCP_Options table for this
-        # port.
-        # TODO(numans) In cases where the below transaction is successful
-        # but the Logical_Switch_Port create or update transaction fails
-        # we need to delete the DHCP_Options row created else it will be
-        # an orphan row.
-        subnet_dhcp_options['options'].update(lsp_dhcpv4_options)
+        # This port has extra DHCP options defined, so we will create a new
+        # row in DHCP_Options table for it.
+        subnet_dhcp_options['options'].update(lsp_dhcp_opts)
         subnet_dhcp_options['external_ids'].update(
             {'port_id': port['id']})
-        with self._nb_ovn.transaction(check_error=True) as txn:
-            txn.add(self._nb_ovn.add_dhcp_options(
-                subnet_id, port_id=port['id'],
-                cidr=subnet_dhcp_options['cidr'],
-                options=subnet_dhcp_options['options'],
-                external_ids=subnet_dhcp_options['external_ids']))
-
-        return self._nb_ovn.get_port_dhcp_options(subnet_id, port['id'])
+        subnet_id = subnet_dhcp_options['external_ids']['subnet_id']
+        add_dhcp_opts_cmd = self._nb_ovn.add_dhcp_options(
+            subnet_id, port_id=port['id'],
+            cidr=subnet_dhcp_options['cidr'],
+            options=subnet_dhcp_options['options'],
+            external_ids=subnet_dhcp_options['external_ids'])
+        return {'cmd': add_dhcp_opts_cmd}
 
     def delete_port_postcommit(self, context):
         """Delete a port.
@@ -890,18 +962,6 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
                                 name=utils.ovn_addrset_name(sg_id, ip_version),
                                 addrs_add=None,
                                 addrs_remove=addresses[ip_version]))
-
-                # Delete the DHCP_Options row if created for this port.
-                # A separate DHCP_Options row would have be created if the port
-                # has extra DHCP options defined.
-                for fixed_ip in port['fixed_ips']:
-                    if netaddr.IPAddress(fixed_ip['ip_address']).version == 4:
-                        lsp_dhcp_options = self._nb_ovn.get_port_dhcp_options(
-                            fixed_ip['subnet_id'], port['id'])
-                        if lsp_dhcp_options:
-                            txn.add(self._nb_ovn.delete_dhcp_options(
-                                lsp_dhcp_options['uuid']))
-                            break
 
     def bind_port(self, context):
         """Attempt to bind a port.
@@ -947,18 +1007,78 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         port = context.current
         vnic_type = port.get(portbindings.VNIC_TYPE, portbindings.VNIC_NORMAL)
         if vnic_type not in self.supported_vnic_types:
-            LOG.debug("Refusing to bind due to unsupported vnic_type: %s",
-                      vnic_type)
+            LOG.debug('Refusing to bind port %(port_id)s due to unsupported '
+                      'vnic_type: %(vnic_type)s' %
+                      {'port_id': port['id'], 'vnic_type': vnic_type})
             return
+
+        # OVN chassis information is needed to ensure a valid port bind.
+        # Collect port binding data and refuse binding if the OVN chassis
+        # cannot be found.
+        chassis_physnets = []
+        try:
+            datapath_type, iface_types, chassis_physnets = \
+                self._sb_ovn.get_chassis_data_for_ml2_bind_port(context.host)
+            iface_types = iface_types.split(',') if iface_types else []
+        except RuntimeError:
+            LOG.debug('Refusing to bind port %(port_id)s due to '
+                      'no OVN chassis for host: %(host)s' %
+                      {'port_id': port['id'], 'host': context.host})
+            return
+
         for segment_to_bind in context.segments_to_bind:
-            if self.vif_type == portbindings.VIF_TYPE_VHOST_USER:
-                port[portbindings.VIF_DETAILS].update({
-                    portbindings.VHOST_USER_SOCKET: utils.ovn_vhu_sockpath(
-                        cfg.CONF.ovn.vhost_sock_dir, port['id'])
-                    })
-            context.set_binding(segment_to_bind[driver_api.ID],
-                                self.vif_type,
-                                self.vif_details)
+            network_type = segment_to_bind['network_type']
+            segmentation_id = segment_to_bind['segmentation_id']
+            physical_network = segment_to_bind['physical_network']
+            LOG.debug('Attempting to bind port %(port_id)s on host %(host)s '
+                      'for network segment with type %(network_type)s, '
+                      'segmentation ID %(segmentation_id)s, '
+                      'physical network %(physical_network)s' %
+                      {'port_id': port['id'],
+                       'host': context.host,
+                       'network_type': network_type,
+                       'segmentation_id': segmentation_id,
+                       'physical_network': physical_network})
+            # TODO(rtheis): This scenario is only valid on an upgrade from
+            # neutron ML2 OVS since invalid network types are prevented during
+            # network creation and update. The upgrade should convert invalid
+            # network types. Once bug/1621879 is fixed, refuse to bind
+            # ports with unsupported network types.
+            if not self._is_network_type_supported(network_type):
+                LOG.info(_LI('Upgrade allowing bind port %(port_id)s with '
+                             'unsupported network type: %(network_type)s'),
+                         {'port_id': port['id'],
+                          'network_type': network_type})
+
+            if (network_type in ['flat', 'vlan']) and \
+               (physical_network not in chassis_physnets):
+                LOG.info(_LI('Refusing to bind port %(port_id)s on '
+                             'host %(host)s due to the OVN chassis '
+                             'bridge mapping physical networks '
+                             '%(chassis_physnets)s not supporting '
+                             'physical network: %(physical_network)s'),
+                         {'port_id': port['id'],
+                          'host': context.host,
+                          'chassis_physnets': chassis_physnets,
+                          'physical_network': physical_network})
+            else:
+                if datapath_type == ovn_const.CHASSIS_DATAPATH_NETDEV and (
+                    ovn_const.CHASSIS_IFACE_DPDKVHOSTUSER in iface_types):
+                    vhost_user_socket = utils.ovn_vhu_sockpath(
+                        config.get_ovn_vhost_sock_dir(), port['id'])
+                    vif_type = portbindings.VIF_TYPE_VHOST_USER
+                    port[portbindings.VIF_DETAILS].update({
+                        portbindings.VHOST_USER_SOCKET: vhost_user_socket
+                        })
+                    vif_details = dict(self.vif_details[vif_type])
+                    vif_details[portbindings.VHOST_USER_SOCKET] = \
+                        vhost_user_socket
+                else:
+                    vif_type = portbindings.VIF_TYPE_OVS
+                    vif_details = self.vif_details[vif_type]
+
+                context.set_binding(segment_to_bind[driver_api.ID], vif_type,
+                                    vif_details)
 
     def get_workers(self):
         """Get any NeutronWorker instances that should have their own process
@@ -970,9 +1090,10 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
         return [ovsdb_monitor.OvnWorker()]
 
     def set_port_status_up(self, port_id):
-        # Port provisioning is complete now that OVN has reported
-        # that the port is up.
-        LOG.debug("OVN reports status up for port: %s", port_id)
+        # Port provisioning is complete now that OVN has reported that the
+        # port is up. Any provisioning block (possibly added during port
+        # creation or when OVN reports that the port is down) must be removed.
+        LOG.info(_LI("OVN reports status up for port: %s"), port_id)
         provisioning_blocks.provisioning_complete(
             n_context.get_admin_context(),
             port_id,
@@ -980,10 +1101,22 @@ class OVNMechanismDriver(driver_api.MechanismDriver):
             provisioning_blocks.L2_AGENT_ENTITY)
 
     def set_port_status_down(self, port_id):
-        LOG.debug("OVN reports status down for port: %s", port_id)
-        self._plugin.update_port_status(n_context.get_admin_context(),
-                                        port_id,
-                                        const.PORT_STATUS_DOWN)
+        # Port provisioning is required now that OVN has reported that the
+        # port is down. Insert a provisioning block and mark the port down
+        # in neutron. The block is inserted before the port status update
+        # to prevent another entity from bypassing the block with its own
+        # port status update.
+        LOG.info(_LI("OVN reports status down for port: %s"), port_id)
+        admin_context = n_context.get_admin_context()
+        try:
+            port = self._plugin.get_port(admin_context, port_id)
+            self._insert_port_provisioning_block(admin_context, port)
+            self._plugin.update_port_status(admin_context,
+                                            port['id'],
+                                            const.PORT_STATUS_DOWN)
+        except (os_db_exc.DBReferenceError, n_exc.PortNotFound):
+            LOG.debug("Port not found during OVN status down report: %s",
+                      port_id)
 
     def update_segment_host_mapping(self, host, phy_nets):
         """Update SegmentHostMapping in DB"""

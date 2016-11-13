@@ -22,14 +22,9 @@ OVN_PROFILE = ovn_const.OVN_PORT_BINDING_PROFILE
 
 class TestOVNVtepPortBinding(test_mech_driver.OVNMechanismDriverTestCase):
 
-    # NOTE(rtheis): The neutron ML2 plugin does not provide drivers with
-    # an interface to validate port bindings. As a result, a 500 error
-    # (i.e. MechanismDriverError) is expected when the port binding
-    # information is invalid.
-
     def test_create_port_with_vtep_options(self):
-        binding = {OVN_PROFILE: {"vtep_physical_switch": 'psw1',
-                   "vtep_logical_switch": 'lsw1'}}
+        binding = {OVN_PROFILE: {"vtep-physical-switch": 'psw1',
+                   "vtep-logical-switch": 'lsw1'}}
         with self.network() as n:
             with self.subnet(n):
                 res = self._create_port(self.fmt, n['network']['id'],
@@ -40,40 +35,55 @@ class TestOVNVtepPortBinding(test_mech_driver.OVNMechanismDriverTestCase):
                                  port['port'][OVN_PROFILE])
 
     def test_create_port_with_only_vtep_physical_switch(self):
-        binding = {OVN_PROFILE: {"vtep_physical_switch": 'psw'}}
+        binding = {OVN_PROFILE: {"vtep-physical-switch": 'psw'}}
         with self.network() as n:
             with self.subnet(n):
                 self._create_port(self.fmt, n['network']['id'],
                                   arg_list=(OVN_PROFILE,),
-                                  expected_res_status=500,
+                                  expected_res_status=400,
                                   **binding)
 
     def test_create_port_with_only_vtep_logical_switch(self):
-        binding = {OVN_PROFILE: {"vtep_logical_switch": 'lsw1'}}
+        binding = {OVN_PROFILE: {"vtep-logical-switch": 'lsw1'}}
         with self.network() as n:
             with self.subnet(n):
                 self._create_port(self.fmt, n['network']['id'],
                                   arg_list=(OVN_PROFILE,),
-                                  expected_res_status=500,
+                                  expected_res_status=400,
                                   **binding)
 
     def test_create_port_with_invalid_vtep_logical_switch(self):
-        binding = {OVN_PROFILE: {"vtep_logical_switch": 1234,
-                                 "vtep_physical_switch": "psw1"}}
+        binding = {OVN_PROFILE: {"vtep-logical-switch": 1234,
+                                 "vtep-physical-switch": "psw1"}}
         with self.network() as n:
             with self.subnet(n):
                 self._create_port(self.fmt, n['network']['id'],
                                   arg_list=(OVN_PROFILE,),
-                                  expected_res_status=500,
+                                  expected_res_status=400,
                                   **binding)
 
     def test_create_port_with_vtep_options_and_parent_name_tag(self):
-        binding = {OVN_PROFILE: {"vtep_logical_switch": "lsw1",
-                                 "vtep_physical_switch": "psw1",
+        binding = {OVN_PROFILE: {"vtep-logical-switch": "lsw1",
+                                 "vtep-physical-switch": "psw1",
                                  "parent_name": "pname", "tag": 22}}
         with self.network() as n:
             with self.subnet(n):
                 self._create_port(self.fmt, n['network']['id'],
                                   arg_list=(OVN_PROFILE,),
-                                  expected_res_status=500,
+                                  expected_res_status=400,
                                   **binding)
+
+    def test_create_port_with_vtep_options_and_check_vtep_keys(self):
+        port = {
+            'id': 'foo-port',
+            'device_owner': 'compute:None',
+            'fixed_ips': [{'subnet_id': 'foo-subnet',
+                           'ip_address': '10.0.0.11'}],
+            OVN_PROFILE: {"vtep-logical-switch": "lsw1",
+                          "vtep-physical-switch": "psw1"}
+        }
+        ovn_port_info = self.mech_driver.get_ovn_port_options(port)
+        self.assertEqual(port[OVN_PROFILE]["vtep-physical-switch"],
+                         ovn_port_info.options["vtep-physical-switch"])
+        self.assertEqual(port[OVN_PROFILE]["vtep-logical-switch"],
+                         ovn_port_info.options["vtep-logical-switch"])

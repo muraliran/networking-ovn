@@ -91,6 +91,10 @@ OVN_NEUTRON_SYNC_MODE=${OVN_NEUTRON_SYNC_MODE:-log}
 # be hosted in OVN. The default OVN L3 scheduler is leastloaded
 OVN_L3_SCHEDULER=${OVN_L3_SCHEDULER:-leastloaded}
 
+# If using OVN_L3_MODE, this sets the L3 ADMIN NETWORK CIDR. This is used to
+# connect distributed logical routers to ovn gateway router
+OVN_L3_ADMIN_NET_CIDR=${OVN_L3_ADMIN_NET_CIDR:-169.254.128.0/30}
+
 # Neutron directory
 NEUTRON_DIR=$DEST/neutron
 
@@ -185,15 +189,50 @@ function configure_ovn_plugin {
         populate_ml2_config /$Q_PLUGIN_CONF_FILE ovn neutron_sync_mode="$OVN_NEUTRON_SYNC_MODE"
         if [[ "$OVN_L3_MODE" == "True" ]]; then
             populate_ml2_config /$Q_PLUGIN_CONF_FILE ovn ovn_l3_scheduler="$OVN_L3_SCHEDULER"
+            populate_ml2_config /$Q_PLUGIN_CONF_FILE ovn ovn_l3_admin_net_cidr="$OVN_L3_ADMIN_NET_CIDR"
         fi
         populate_ml2_config /$Q_PLUGIN_CONF_FILE ovn ovn_native_dhcp="$OVN_NATIVE_DHCP"
         populate_ml2_config /$Q_PLUGIN_CONF_FILE securitygroup enable_security_group="$Q_USE_SECGROUP"
         inicomment /$Q_PLUGIN_CONF_FILE securitygroup firewall_driver
     fi
 
+    # NOTE(rtheis): Conventional and native DHCP are not supported at the
+    # same time since there aren't any confirmed benefits to supporting
+    # both. Also, there are a couple problems with such a setup:
+    #   1) Neutron still creates DHCP provisioning blocks when launching
+    #      instances. As a result, the conventional DHCP agent must be
+    #      up and remove the DHCP provisioning blocks or instances will
+    #      fail to launch.
+    #   2) Even though the conventional DHCP agent can setup a metadata
+    #      proxy for isolated networks, host routes are not added to an
+    #      instance. As a result, instances aren't able to access the proxy
+    #      via "curl http://169.254.169.254".
+    if is_service_enabled q-dhcp ; then
+        if [[ "$OVN_NATIVE_DHCP" == "True" ]]; then
+            die $LINENO "The q-dhcp service must be disabled with OVN_NATIVE_DHCP set to True."
+        fi
+    fi
+
     if is_service_enabled q-l3 ; then
         if [[ "$OVN_L3_MODE" == "True" ]]; then
             die $LINENO "The q-l3 service must be disabled with OVN_L3_MODE set to True."
+        fi
+    fi
+
+    # NOTE(rtheis): OVN native layer-3 and DHCP services currently lack support
+    # for metadata. Thus, enabling both native services also requires enabling
+    # config drive to provide instances with metadata. However, if you choose the
+    # conventional DHCP agent instead of the native DHCP service, you can
+    # configure it to provide instances with metadata.
+    if is_service_enabled q-dhcp ; then
+        # Conventional DHCP agent must provide all metadata when OVN native
+        # layer-3 is enabled. So for consistency, regardless of the layer-3
+        # support, the conventional DHCP agent will be forced to provide
+        # metadata for all networks.
+        iniset $Q_DHCP_CONF_FILE DEFAULT force_metadata True
+    elif [[ "$OVN_NATIVE_DHCP" == "True" && "$OVN_L3_MODE" == "True" ]]; then
+        if is_service_enabled n-cpu ; then
+            iniset $NOVA_CONF DEFAULT force_config_drive True
         fi
     fi
 
@@ -246,9 +285,11 @@ function install_ovn {
     done
 
     if ! is_neutron_enabled ; then
-        # networking-ovn depends on neutron, so ensure it at least gets
-        # installed.
+        # NOTE(rtheis): networking-ovn depends on neutron, so ensure it at
+        # least gets installed and its configuration directory exists (which
+        # is needed by the multinode job).
         install_neutron
+        sudo install -d -o $STACK_USER $NEUTRON_CONF_DIR
     fi
 
     setup_develop $DEST/networking-ovn
@@ -348,7 +389,7 @@ function start_ovs {
     if is_ovn_service_enabled ovn-controller || is_ovn_service_enabled ovn-controller-vtep ; then
         ovs-vsctl --no-wait set open_vswitch . external-ids:ovn-remote="$OVN_SB_REMOTE"
         ovs-vsctl --no-wait set open_vswitch . external-ids:ovn-bridge="br-int"
-        ovs-vsctl --no-wait set open_vswitch . external-ids:ovn-encap-type="geneve"
+        ovs-vsctl --no-wait set open_vswitch . external-ids:ovn-encap-type="geneve,vxlan"
         ovs-vsctl --no-wait set open_vswitch . external-ids:ovn-encap-ip="$HOST_IP"
 
         ovn_base_setup_bridge br-int
@@ -421,7 +462,7 @@ function start_ovn {
         # a pid file to work with, so ...
         echo -n "Waiting for ovn-northd to start ... "
         OVN_NORTHD_PID="/usr/local/var/run/openvswitch/ovn-northd.pid"
-        local testcmd="test -e $OVN_NORTH_PID"
+        local testcmd="test -e $OVN_NORTHD_PID"
         test_with_retry "$testcmd" "ovn-northd did not start" $SERVICE_TIMEOUT 1
         echo "done."
         sudo ovs-appctl -t ovn-northd vlog/set "PATTERN:CONSOLE:%D{%Y-%m-%dT%H:%M:%S.###Z}|%05N|%c%T|%p|%m"
@@ -471,11 +512,19 @@ function create_public_bridge {
     ext_gw_ifc=$(get_ext_gw_interface)
 
     sudo ovs-vsctl --may-exist add-br $ext_gw_ifc -- set bridge $ext_gw_ifc protocols=OpenFlow13
-    sudo ovs-vsctl set open . external-ids:ovn-bridge-mappings=provider:$ext_gw_ifc
+    sudo ovs-vsctl set open . external-ids:ovn-bridge-mappings=$PHYSICAL_NETWORK:$ext_gw_ifc
     if [ -n "$FLOATING_RANGE" ]; then
         local cidr_len=${FLOATING_RANGE#*/}
         sudo ip addr add $PUBLIC_NETWORK_GATEWAY/$cidr_len dev $ext_gw_ifc
     fi
+
+    # Ensure IPv6 RAs are accepted on the interface with the default route.
+    # This is needed for neutron-based devstack clouds to work in
+    # IPv6-only clouds in the gate. Please do not remove this without
+    # talking to folks in Infra. This fix is based on a devstack fix for
+    # neutron L3 agent: https://review.openstack.org/#/c/359490/.
+    default_route_dev=$(ip route | grep ^default | awk '{print $5}')
+    sudo sysctl -w net.ipv6.conf.$default_route_dev.accept_ra=2
 
     sudo sysctl -w net.ipv6.conf.all.forwarding=1
     if [ -n "$IPV6_PUBLIC_RANGE" ]; then

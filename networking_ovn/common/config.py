@@ -17,13 +17,7 @@ from neutron.extensions import portbindings
 
 
 ovn_opts = [
-    cfg.StrOpt('ovsdb_connection', deprecated_for_removal=True,
-               default='tcp:127.0.0.1:6640',
-               help=_('The connection string for the native OVSDB backend.'
-                      'This option is going to be deprecated and be replaced'
-                      'by option ovn_nb_connection.')),
     cfg.StrOpt('ovn_nb_connection',
-               deprecated_name='ovsdb_connection',
                default='tcp:127.0.0.1:6641',
                help=_('The connection string for the OVN_Northbound OVSDB')),
     cfg.StrOpt('ovn_sb_connection',
@@ -62,6 +56,10 @@ ovn_opts = [
                       'selected \n'
                       'chance - chassis randomly selected')),
     cfg.StrOpt("vif_type",
+               deprecated_for_removal=True,
+               deprecated_reason="The port VIF type is now determined based "
+                                 "on the OVN chassis information when the "
+                                 "port is bound to a host.",
                default=portbindings.VIF_TYPE_OVS,
                help=_("Type of VIF to be used for ports valid values are "
                       "(%(ovs)s, %(dpdk)s) default %(ovs)s") % {
@@ -80,6 +78,11 @@ ovn_opts = [
                default=(12 * 60 * 60),
                help=_('Default least time (in seconds ) to use when '
                       'ovn_native_dhcp is enabled.')),
+    cfg.StrOpt("ovn_l3_admin_net_cidr",
+               default='169.254.128.0/30',
+               help=_('Admin network used for connecting distributed '
+                      'routers to gateway routers. Do not change the value '
+                      'for existing deployments that contain routers.'))
 ]
 
 cfg.CONF.register_opts(ovn_opts, group='ovn')
@@ -115,10 +118,6 @@ def get_ovn_l3_scheduler():
     return cfg.CONF.ovn.ovn_l3_scheduler
 
 
-def get_ovn_vif_type():
-    return cfg.CONF.ovn.vif_type
-
-
 def get_ovn_vhost_sock_dir():
     return cfg.CONF.ovn.vhost_sock_dir
 
@@ -129,3 +128,7 @@ def is_ovn_dhcp():
 
 def get_ovn_dhcp_default_lease_time():
     return cfg.CONF.ovn.dhcp_default_lease_time
+
+
+def get_ovn_l3_admin_net_cidr():
+    return cfg.CONF.ovn.ovn_l3_admin_net_cidr

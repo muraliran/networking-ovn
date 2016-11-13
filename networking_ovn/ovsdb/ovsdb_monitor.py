@@ -14,8 +14,8 @@
 
 import atexit
 from eventlet import greenthread
-import retrying
-from six.moves.queue import Queue
+from six.moves import queue
+import tenacity
 import threading
 
 from oslo_log import log
@@ -26,13 +26,12 @@ from networking_ovn._i18n import _LE
 from networking_ovn.common import config as ovn_config
 from networking_ovn.ovsdb import row_event
 from neutron.agent.ovsdb.native import connection
-from neutron.agent.ovsdb.native import helpers
 from neutron.agent.ovsdb.native import idlutils
 from neutron.common import config
-from neutron.common import utils as n_utils
 from neutron import manager
-from neutron.plugins.common import constants as plugin_constants
 from neutron import worker
+from neutron_lib import constants
+from neutron_lib.utils import helpers
 
 LOG = log.getLogger(__name__)
 
@@ -43,7 +42,7 @@ class ChassisEvent(row_event.RowEvent):
     def __init__(self, driver):
         self.driver = driver
         self.l3_plugin = manager.NeutronManager.get_service_plugins().get(
-            plugin_constants.L3_ROUTER_NAT)
+            constants.L3)
         table = 'Chassis'
         events = (self.ROW_CREATE, self.ROW_UPDATE, self.ROW_DELETE)
         super(ChassisEvent, self).__init__(events, table, None)
@@ -54,7 +53,7 @@ class ChassisEvent(row_event.RowEvent):
         phy_nets = []
         if event != self.ROW_DELETE:
             bridge_mappings = row.external_ids.get('ovn-bridge-mappings', '')
-            mapping_dict = n_utils.parse_mappings(bridge_mappings.split(','))
+            mapping_dict = helpers.parse_mappings(bridge_mappings.split(','))
             phy_nets = list(mapping_dict)
 
         self.driver.update_segment_host_mapping(host, phy_nets)
@@ -149,7 +148,7 @@ class OvnDbNotifyHandler(object):
         self.driver = driver
         self.__watched_events = set()
         self.__lock = threading.Lock()
-        self.notifications = Queue()
+        self.notifications = queue.Queue()
         self.notify_thread = greenthread.spawn_n(self.notify_loop)
         atexit.register(self.shutdown)
 
@@ -299,7 +298,30 @@ class OvnSbIdl(OvnIdl):
         self.notify_handler.watch_events([self._chassis_event])
 
 
-class OvnConnection(connection.Connection):
+class OvnBaseConnection(connection.Connection):
+
+    def get_schema_helper(self):
+        """Retrieve the schema helper object from OVSDB"""
+        # The implementation of this function is same as the base class method
+        # without the enable_connection_uri() called (since ovs-vsctl won't
+        # exist on the controller node when using the reference architecture).
+        try:
+            helper = idlutils.get_schema_helper(self.connection,
+                                                self.schema_name)
+        except Exception:
+            # There is a small window for a race, so retry up to a second
+            @tenacity.retry(wait=tenacity.wait_exponential(multiplier=0.01),
+                            stop=tenacity.stop_after_delay(1),
+                            reraise=True)
+            def do_get_schema_helper():
+                return idlutils.get_schema_helper(self.connection,
+                                                  self.schema_name)
+            helper = do_get_schema_helper()
+
+        return helper
+
+
+class OvnConnection(OvnBaseConnection):
 
     def get_ovn_idl_cls(self):
         """Get the ovn idl class
@@ -315,25 +337,12 @@ class OvnConnection(connection.Connection):
 
     def start(self, driver, table_name_list=None):
         # The implementation of this function is same as the base class start()
-        # except that OvnIdl object is created instead of idl.Idl
+        # except that OvnIdl object is created instead of idl.Idl.
         with self.lock:
             if self.idl is not None:
                 return
 
-            try:
-                helper = idlutils.get_schema_helper(self.connection,
-                                                    self.schema_name)
-            except Exception:
-                # We may have failed do to set-manager not being called
-                helpers.enable_connection_uri(self.connection)
-
-                # There is a small window for a race, so retry up to a second
-                @retrying.retry(wait_exponential_multiplier=10,
-                                stop_max_delay=1000)
-                def do_get_schema_helper():
-                    return idlutils.get_schema_helper(self.connection,
-                                                      self.schema_name)
-                helper = do_get_schema_helper()
+            helper = self.get_schema_helper()
 
             if table_name_list is None:
                 helper.register_all()

@@ -16,7 +16,7 @@ from oslo_config import cfg
 from oslo_db import options as db_options
 from oslo_log import log as logging
 
-from neutron.agent import securitygroups_rpc
+from neutron.conf.agent import securitygroups_rpc
 from neutron import context
 from neutron import manager
 from neutron import opts as neutron_options
@@ -94,7 +94,7 @@ def main():
             LOG.error(_LE('No "ovn" mechanism driver found : "%s".'),
                       cfg.CONF.ml2.mechanism_drivers)
             return
-        cfg.CONF.ml2.mechanism_drivers = ['ovn-sync']
+        cfg.CONF.set_override('mechanism_drivers', ['ovn-sync'], 'ml2')
         conf.service_plugins = ['networking_ovn.l3.l3_ovn.OVNL3RouterPlugin']
     else:
         LOG.error(_LE('Invalid core plugin : ["%s"].'), cfg.CONF.core_plugin)
@@ -123,10 +123,10 @@ def main():
                           "--database-connection value again"))
         return
     try:
-        synchronizer.sync_networks_and_ports(ctx)
+        synchronizer.sync_networks_ports_and_dhcp_opts(ctx)
     except Exception:
-        LOG.exception(_LE("Error syncing  Networks and Ports for unknown "
-                          "reason please try again"))
+        LOG.exception(_LE("Error syncing  Networks, Ports and DHCP options "
+                          "for unknown reason please try again"))
         return
     try:
         synchronizer.sync_acls(ctx)
